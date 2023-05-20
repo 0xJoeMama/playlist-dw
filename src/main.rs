@@ -341,7 +341,12 @@ async fn main() -> Result<()> {
             // since this might be daemon-ified we need to handle errors in this case
             match info.download().await {
                 Result::Ok(_) => println!("Success"),
-                Err(err) => eprintln!("Failed to download: {err}"),
+                Err(err) => {
+                    eprintln!("Error occured! Printing stacktrace...");
+                    for inner in err.chain() {
+                        eprintln!("{inner}");
+                    }
+                }
             }
         }
 
