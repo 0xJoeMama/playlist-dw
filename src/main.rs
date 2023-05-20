@@ -1,4 +1,12 @@
-use std::{cmp, collections::HashSet, path::PathBuf, process::Output, sync::Arc, time::Duration};
+use std::{
+    cmp,
+    collections::HashSet,
+    env,
+    path::PathBuf,
+    process::{Output, Stdio},
+    sync::Arc,
+    time::Duration,
+};
 
 use anyhow::{Ok, Result};
 
@@ -10,7 +18,7 @@ use tokio::{
     fs::{self, File, OpenOptions},
     io::{AsyncReadExt, AsyncWriteExt},
     process::Command,
-    sync::Mutex,
+    sync::RwLock,
     task::JoinSet,
     time,
 };
@@ -30,43 +38,65 @@ const YT_DLP_ARGS: [&str; 8] = [
 ];
 
 #[derive(Debug, Serialize, Deserialize, Parser)]
-#[command(author, version, about, long_about = None)]
+#[command(author, version, about)]
 struct Config {
-    #[arg(short, long)]
-    #[clap(default_value = "songs")]
+    /// Where the downloaded songs will be placed. You probably want this to be your local music
+    /// library
+    #[arg(short, long, default_value = "songs")]
     output_dir: PathBuf,
+    /// Where download cache will be put. This should probably be near the songs folder.
     #[arg(short, long)]
     #[clap(default_value = "cache")]
     cache_file: PathBuf,
+    /// The ID of the target playlist. The playlist ID is part of the playlist link. To get it,
+    /// open your playlist, check its link and copy everything after "link="
     playlist_id: String,
-    #[arg(short, long)]
-    #[clap(default_value = "50")]
+    /// The maximum amount of results the YouTube API should respond with.
+    /// Higher numbers increase request latency, but decrease request amounts.
+    /// Set to the maximum by default.
+    #[arg(short, long, default_value_t = 50)]
     max_results: u8,
-    #[arg(short, long)]
-    #[clap(default_value = "false")]
+    /// Whether the app should run as a daemon process.
+    /// If run as a daemon, it stays active in the background and reruns every set amount of
+    /// seconds.
+    #[arg(short, long, default_value_t = false)]
     daemon: bool,
-    #[arg(short, long)]
-    #[clap(default_value = "7200")]
+    /// How often the app should run, if in daemon mode.
+    #[arg(short, long, default_value_t = 7200)]
     seconds_interval: u64,
+    /// Maximum amount of tasks the app should launch on download.
+    /// Higher numbers make downloads faster, but take up more CPU cycles(stress out the computer
+    /// more).
+    #[arg(long, default_value_t = 10)]
+    max_tasks: usize,
 }
 
+/// Download cache
 #[derive(Debug)]
 struct Cache {
+    // old cache stored as a set
     inner: HashSet<String>,
+    // file that is kept open while the app is running
     cache_file: File,
+    // whether there has been an update
     dirty: bool,
 }
 
 impl Cache {
-    async fn get_or_create(cfg: &Config) -> Result<Self> {
+    /// Create a [Cache] object using the provided runtime config.
+    /// Will attempt to parse an existing file, but if it fails it will create a new file.
+    async fn from(cfg: &Config) -> Result<Self> {
         let path = &cfg.cache_file;
+        // if it exists parse it
         if path.exists() {
             let mut file = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .append(true)
+                .read(true) // we need read for now
+                .write(true) // we need write for emit
+                .append(true) // we open in append mode so as not to delete other cached files
                 .open(path)
                 .await?;
+
+            // parse the contents of the existing file
             let set = {
                 let mut contents = String::new();
                 file.read_to_string(&mut contents).await?;
@@ -80,6 +110,7 @@ impl Cache {
                 dirty: false,
             })
         } else {
+            // otherwise create it anew
             Ok(Self {
                 inner: HashSet::new(),
                 cache_file: File::create(path).await?,
@@ -92,6 +123,7 @@ impl Cache {
         self.inner.contains(url)
     }
 
+    /// Appends 'urls' to the end of the file, **without saving**.
     async fn emit(&mut self, urls: &[String]) -> Result<()> {
         let mut output = urls.join("\n");
         output.push('\n');
@@ -102,6 +134,7 @@ impl Cache {
         Ok(())
     }
 
+    // Saves the file, if there were changes to it.
     async fn poll(&mut self) -> Result<()> {
         if self.dirty {
             self.cache_file.flush().await?;
@@ -111,15 +144,18 @@ impl Cache {
     }
 }
 
+/// Required information from YouTube API and also the runtime config.
 #[derive(Debug)]
 struct DownloadInfo {
-    song_urls: Vec<String>,
-    output_dir: PathBuf,
-    cache: Cache,
+    song_urls: Vec<String>, // urls to be downloaded
+    output_dir: PathBuf,    // the output directory
+    cache: Cache,           // local cache
+    max_tasks: usize,       // max amount of tasks to start
 }
 
 impl DownloadInfo {
-    async fn new(cfg: &Config, client: &Client, key: &str) -> Result<Self> {
+    // Collect the necessary information for a run.
+    async fn collect(cfg: &Config, client: &Client, key: &str) -> Result<Self> {
         println!("Fetching playlist info...");
         let playlist_info = client
             .get(PLAYLIST_INFO_FETCH_URL)
@@ -130,9 +166,9 @@ impl DownloadInfo {
                 ("key", key),
             ])
             .send()
+            .await?
+            .json::<Value>()
             .await?;
-
-        let playlist_info: Value = serde_json::from_str(&playlist_info.text().await?)?;
 
         let size = playlist_info
             .get("items")
@@ -144,13 +180,15 @@ impl DownloadInfo {
 
         println!("Playlist size: {}", size);
 
-        let cache = Cache::get_or_create(cfg).await?;
+        let cache = Cache::from(cfg).await?;
 
         let song_urls = Self::init_song_list(size, cfg, client, key, &cache).await?;
+
         Ok(Self {
             song_urls,
             output_dir: cfg.output_dir.clone(),
             cache,
+            max_tasks: cfg.max_tasks,
         })
     }
 
@@ -169,6 +207,7 @@ impl DownloadInfo {
             ("playlistId", &cfg.playlist_id),
             ("key", key),
             ("maxResults", &cfg.max_results.to_string()),
+            // we ask for very specific fields to improve latency
             ("fields", "items/contentDetails/videoId,nextPageToken"),
         ];
 
@@ -183,9 +222,7 @@ impl DownloadInfo {
                 req
             };
 
-            let playlist_items = req.send().await?;
-
-            let json: Value = serde_json::from_str(&playlist_items.text().await?)?;
+            let json = req.send().await?.json::<Value>().await?;
 
             if let Some(tkn) = json.get("nextPageToken") {
                 page_token = tkn.as_str().map(str::to_owned);
@@ -210,7 +247,7 @@ impl DownloadInfo {
         }
 
         println!(
-            "Done fetching playlist items. {} new items found",
+            "Done fetching playlist items: {} new items found",
             items.len()
         );
 
@@ -219,18 +256,20 @@ impl DownloadInfo {
 
     async fn create_task(
         urls: &[String],
-        cache: Arc<Mutex<Cache>>, // cursed type kekw
+        cache: Arc<RwLock<Cache>>, // cursed type kekw
         outdir: PathBuf,
     ) -> Result<Output> {
         let mut cmd = Command::new("yt-dlp");
         let out = cmd
             .current_dir(outdir)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
             .args(YT_DLP_ARGS)
             .args(urls)
             .output()
             .await?;
 
-        cache.lock().await.emit(urls).await?;
+        cache.write().await.emit(urls).await?;
         Ok(out)
     }
 
@@ -244,9 +283,11 @@ impl DownloadInfo {
         }
 
         let outdir = self.output_dir;
-        let batch_size = self.song_urls.len() / 10;
+        let batch_size = self.song_urls.len() / self.max_tasks + 1;
         let urls = Arc::new(self.song_urls);
-        let cache = Arc::new(Mutex::new(self.cache));
+        let cache = Arc::new(RwLock::new(self.cache));
+
+        println!("Starting download of {} items", urls.len());
 
         let mut js = JoinSet::new();
         for batch in (0..urls.len()).step_by(batch_size) {
@@ -261,11 +302,10 @@ impl DownloadInfo {
             });
         }
 
-        println!("Starting download of {} items", urls.len());
-
         while js.join_next().await.is_some() {}
 
-        cache.lock().await.poll().await?;
+        println!("Done downloading. Writing cache.");
+        cache.write().await.poll().await?;
 
         Ok(())
     }
@@ -273,20 +313,38 @@ impl DownloadInfo {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // initialize dev env vars
+    #[cfg(debug_assertions)]
     dotenv::dotenv()?;
+
+    // parse command line arguments in a runtime config
     let cfg = Config::parse();
 
-    let key = dotenv::var("YOUTUBE_API_KEY")?;
+    // get the API key from the environment
+    let key = env::var("YOUTUBE_API_KEY")?;
+    #[cfg(debug_assertions)]
     println!("Using API key: {}", key);
 
+    // HTTP client
     let client = Client::builder().gzip(true).build()?;
 
+    // create an interval which will be used in case this was run as a daemon process
     let mut interval = time::interval(Duration::from_secs(cfg.seconds_interval));
 
     loop {
+        // the first turn, this will run immediately
         interval.tick().await;
-        let info = DownloadInfo::new(&cfg, &client, &key).await?;
-        info.download().await?;
+        // create the required metadata for the download
+        // this includes collecting the urls as well as creating/parsing the cache that will be/is used.
+        if let Result::Ok(info) = DownloadInfo::collect(&cfg, &client, &key).await {
+            // induce the download using the collected info
+            // since this might be daemon-ified we need to handle errors in this case
+            match info.download().await {
+                Result::Ok(_) => println!("Success"),
+                Err(err) => eprintln!("Failed to download: {err}"),
+            }
+        }
+
         if !cfg.daemon {
             break;
         }
