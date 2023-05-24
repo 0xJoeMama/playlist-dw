@@ -3,7 +3,7 @@ use std::{
     collections::HashSet,
     env,
     path::PathBuf,
-    process::{Output, Stdio},
+    process::{ExitStatus, Stdio},
     sync::Arc,
     time::Duration,
 };
@@ -75,7 +75,7 @@ struct Config {
 #[derive(Debug)]
 struct Cache {
     // old cache stored as a set
-    inner: HashSet<String>,
+    contents: HashSet<String>,
     // file that is kept open while the app is running
     cache_file: File,
     // whether there has been an update
@@ -87,9 +87,9 @@ impl Cache {
     /// Will attempt to parse an existing file, but if it fails it will create a new file.
     async fn from(cfg: &Config) -> Result<Self> {
         let path = &cfg.cache_file;
-        // if it exists parse it
+
         if path.exists() {
-            let mut file = OpenOptions::new()
+            let mut cache_file = OpenOptions::new()
                 .read(true) // we need read for now
                 .write(true) // we need write for emit
                 .append(true) // we open in append mode so as not to delete other cached files
@@ -97,22 +97,21 @@ impl Cache {
                 .await?;
 
             // parse the contents of the existing file
-            let set = {
+            let contents = {
                 let mut contents = String::new();
-                file.read_to_string(&mut contents).await?;
+                cache_file.read_to_string(&mut contents).await?;
 
                 contents.lines().map(str::to_owned).collect()
             };
 
             Ok(Self {
-                inner: set,
-                cache_file: file,
+                contents,
+                cache_file,
                 dirty: false,
             })
         } else {
-            // otherwise create it anew
             Ok(Self {
-                inner: HashSet::new(),
+                contents: HashSet::new(),
                 cache_file: File::create(path).await?,
                 dirty: false,
             })
@@ -120,7 +119,7 @@ impl Cache {
     }
 
     fn contains(&self, url: &str) -> bool {
-        self.inner.contains(url)
+        self.contents.contains(url)
     }
 
     /// Appends 'urls' to the end of the file, **without saving**.
@@ -135,7 +134,7 @@ impl Cache {
     }
 
     // Saves the file, if there were changes to it.
-    async fn poll(&mut self) -> Result<()> {
+    async fn save(&mut self) -> Result<()> {
         if self.dirty {
             self.cache_file.flush().await?;
         }
@@ -147,10 +146,10 @@ impl Cache {
 /// Required information from YouTube API and also the runtime config.
 #[derive(Debug)]
 struct DownloadInfo {
-    song_urls: Vec<String>, // urls to be downloaded
-    output_dir: PathBuf,    // the output directory
-    cache: Cache,           // local cache
-    max_tasks: usize,       // max amount of tasks to start
+    pending_urls: Vec<String>, // urls to be downloaded
+    output_dir: PathBuf,       // the output directory
+    cache: Cache,              // local cache
+    max_tasks: usize,          // max amount of tasks to start
 }
 
 impl DownloadInfo {
@@ -170,7 +169,7 @@ impl DownloadInfo {
             .json::<Value>()
             .await?;
 
-        let size = playlist_info
+        let playlist_size = playlist_info
             .get("items")
             .and_then(|items| items.get(0))
             .and_then(|first_onj| first_onj.get("contentDetails"))
@@ -178,14 +177,14 @@ impl DownloadInfo {
             .and_then(Value::as_u64)
             .expect("Failed to get playlist size");
 
-        println!("Playlist size: {}", size);
+        println!("Playlist size: {}", playlist_size);
 
         let cache = Cache::from(cfg).await?;
 
-        let song_urls = Self::init_song_list(size, cfg, client, key, &cache).await?;
+        let pending_urls = Self::init_song_list(playlist_size, cfg, client, key, &cache).await?;
 
         Ok(Self {
-            song_urls,
+            pending_urls,
             output_dir: cfg.output_dir.clone(),
             cache,
             max_tasks: cfg.max_tasks,
@@ -193,16 +192,16 @@ impl DownloadInfo {
     }
 
     async fn init_song_list(
-        size: u64,
+        playlist_size: u64,
         cfg: &Config,
         client: &Client,
         key: &str,
         cache: &Cache,
     ) -> Result<Vec<String>> {
-        let mut items = Vec::new();
-        let mut fetched: u64 = 0;
-        let mut page_token: Option<String> = None;
-        let params = &[
+        let mut urls = Vec::new();
+        let mut fetched_cnt: u64 = 0;
+        let mut next_page_token: Option<String> = None;
+        let req_params = &[
             ("part", "contentDetails"),
             ("playlistId", &cfg.playlist_id),
             ("key", key),
@@ -213,23 +212,24 @@ impl DownloadInfo {
 
         println!("Fetching playlist items");
 
-        while fetched < size {
-            let req = client.get(PLAYLIST_ITEMS_FETCH_URL).query(params);
+        while fetched_cnt < playlist_size {
+            let req = client.get(PLAYLIST_ITEMS_FETCH_URL).query(req_params);
 
-            let req = if let Some(ref token) = page_token {
+            let req = if let Some(ref token) = next_page_token {
                 req.query(&[("pageToken", token)])
             } else {
                 req
             };
 
-            let json = req.send().await?.json::<Value>().await?;
+            let res = req.send().await?.json::<Value>().await?;
 
-            if let Some(tkn) = json.get("nextPageToken") {
-                page_token = tkn.as_str().map(str::to_owned);
+            if let Some(tkn) = res.get("nextPageToken") {
+                next_page_token = tkn.as_str().map(str::to_owned);
             }
 
-            // TODO: Maybe don't(?) create 64 strings...
-            for item_id in json
+            // TODO: Maybe don't(?) create strings...
+            // API returns
+            for song_id in res
                 .get("items")
                 .and_then(Value::as_array)
                 .iter()
@@ -238,43 +238,43 @@ impl DownloadInfo {
                 .filter_map(|content_details| content_details.get("videoId"))
                 .filter_map(Value::as_str)
             {
-                fetched += 1;
-                let url = format!("https://www.youtube.com/watch?v={}", item_id);
+                fetched_cnt += 1;
+                let url = format!("https://www.youtube.com/watch?v={}", song_id);
                 if !cache.contains(&url) {
-                    items.push(url);
+                    urls.push(url);
                 }
             }
         }
 
         println!(
             "Done fetching playlist items: {} new items found",
-            items.len()
+            urls.len()
         );
 
-        Ok(items)
+        Ok(urls)
     }
 
-    async fn create_task(
+    async fn create_download_task(
         urls: &[String],
         cache: Arc<RwLock<Cache>>, // cursed type kekw
         outdir: PathBuf,
-    ) -> Result<Output> {
+    ) -> Result<ExitStatus> {
         let mut cmd = Command::new("yt-dlp");
-        let out = cmd
+        let status = cmd
             .current_dir(outdir)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .args(YT_DLP_ARGS)
             .args(urls)
-            .output()
+            .status()
             .await?;
 
         cache.write().await.emit(urls).await?;
-        Ok(out)
+        Ok(status)
     }
 
     async fn download(self) -> Result<()> {
-        if self.song_urls.is_empty() {
+        if self.pending_urls.is_empty() {
             return Ok(());
         }
 
@@ -283,29 +283,33 @@ impl DownloadInfo {
         }
 
         let outdir = self.output_dir;
-        let batch_size = self.song_urls.len() / self.max_tasks + 1;
-        let urls = Arc::new(self.song_urls);
+        let batch_size = self.pending_urls.len() / self.max_tasks + 1;
+        let urls = Arc::new(self.pending_urls);
         let cache = Arc::new(RwLock::new(self.cache));
 
         println!("Starting download of {} items", urls.len());
 
-        let mut js = JoinSet::new();
-        for batch in (0..urls.len()).step_by(batch_size) {
-            let urls = urls.clone();
-            let cache = cache.clone();
-            let outdir = outdir.clone();
+        let mut js = (0..urls.len())
+            .step_by(batch_size)
+            .map(|batch| {
+                let urls = urls.clone();
+                let cache = cache.clone();
+                let outdir = outdir.clone();
 
-            js.spawn(async move {
-                // cursed slicing...
-                let batch = &urls[batch..cmp::min(batch + batch_size, urls.len())];
-                Self::create_task(batch, cache, outdir).await
+                async move {
+                    let batch = &urls[batch..cmp::min(batch + batch_size, urls.len())];
+                    Self::create_download_task(batch, cache, outdir).await
+                }
+            })
+            .fold(JoinSet::new(), |mut js, next| {
+                js.spawn(next);
+                js
             });
-        }
 
         while js.join_next().await.is_some() {}
 
         println!("Done downloading. Writing cache.");
-        cache.write().await.poll().await?;
+        cache.write().await.save().await?;
 
         Ok(())
     }
