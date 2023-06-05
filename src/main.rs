@@ -5,22 +5,22 @@ use std::{
     path::PathBuf,
     process::{ExitStatus, Stdio},
     sync::Arc,
+    thread,
     time::Duration,
 };
 
-use anyhow::{Ok, Result};
+use anyhow::{anyhow, Ok, Result};
 
 use clap::Parser;
 use reqwest::Client;
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::Value as JsonValue;
 use tokio::{
     fs::{self, File, OpenOptions},
     io::{AsyncReadExt, AsyncWriteExt},
     process::Command,
-    sync::RwLock,
+    runtime::Builder as RuntimeBuilder,
+    sync::Mutex,
     task::JoinSet,
-    time,
 };
 
 const PLAYLIST_INFO_FETCH_URL: &str = "https://www.googleapis.com/youtube/v3/playlists";
@@ -37,7 +37,7 @@ const YT_DLP_ARGS: [&str; 8] = [
     "%(title).90s.%(ext)s",
 ];
 
-#[derive(Debug, Serialize, Deserialize, Parser)]
+#[derive(Debug, Parser)]
 #[command(author, version, about)]
 struct Config {
     /// Where the downloaded songs will be placed. You probably want this to be your local music
@@ -137,6 +137,7 @@ impl Cache {
     async fn save(&mut self) -> Result<()> {
         if self.dirty {
             self.cache_file.flush().await?;
+            self.dirty = false;
         }
 
         Ok(())
@@ -166,7 +167,7 @@ impl DownloadInfo {
             ])
             .send()
             .await?
-            .json::<Value>()
+            .json::<JsonValue>()
             .await?;
 
         let playlist_size = playlist_info
@@ -174,7 +175,7 @@ impl DownloadInfo {
             .and_then(|items| items.get(0))
             .and_then(|first_onj| first_onj.get("contentDetails"))
             .and_then(|content_details| content_details.get("itemCount"))
-            .and_then(Value::as_u64)
+            .and_then(JsonValue::as_u64)
             .expect("Failed to get playlist size");
 
         println!("Playlist size: {}", playlist_size);
@@ -221,7 +222,7 @@ impl DownloadInfo {
                 req
             };
 
-            let res = req.send().await?.json::<Value>().await?;
+            let res = req.send().await?.json::<JsonValue>().await?;
 
             if let Some(tkn) = res.get("nextPageToken") {
                 next_page_token = tkn.as_str().map(str::to_owned);
@@ -231,15 +232,21 @@ impl DownloadInfo {
             // API returns
             for song_id in res
                 .get("items")
-                .and_then(Value::as_array)
+                .and_then(JsonValue::as_array)
                 .iter()
                 .flat_map(|items| items.iter())
                 .filter_map(|item| item.get("contentDetails"))
                 .filter_map(|content_details| content_details.get("videoId"))
-                .filter_map(Value::as_str)
             {
                 fetched_cnt += 1;
-                let url = format!("https://www.youtube.com/watch?v={}", song_id);
+                let url = {
+                    if let Some(song_id) = song_id.as_str() {
+                        String::from("https://www.youtube.com/watch?v=") + song_id
+                    } else {
+                        return Err(anyhow!("Could not properly parse playlistItems request"));
+                    }
+                };
+
                 if !cache.contains(&url) {
                     urls.push(url);
                 }
@@ -256,7 +263,7 @@ impl DownloadInfo {
 
     async fn create_download_task(
         urls: &[String],
-        cache: Arc<RwLock<Cache>>, // cursed type kekw
+        cache: Arc<Mutex<Cache>>, // cursed type kekw
         outdir: PathBuf,
     ) -> Result<ExitStatus> {
         let mut cmd = Command::new("yt-dlp");
@@ -264,12 +271,15 @@ impl DownloadInfo {
             .current_dir(outdir)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
+            .stderr(Stdio::null())
             .args(YT_DLP_ARGS)
             .args(urls)
-            .status()
+            .spawn()?
+            .wait()
             .await?;
 
-        cache.write().await.emit(urls).await?;
+        cache.lock().await.emit(urls).await?;
+        println!("Dropped cache, urls, outdir");
         Ok(status)
     }
 
@@ -282,19 +292,20 @@ impl DownloadInfo {
             fs::create_dir_all(&self.output_dir).await?;
         }
 
+        let batch_size = cmp::max(1, self.pending_urls.len() / self.max_tasks);
+
         let outdir = self.output_dir;
-        let batch_size = self.pending_urls.len() / self.max_tasks + 1;
         let urls = Arc::new(self.pending_urls);
-        let cache = Arc::new(RwLock::new(self.cache));
+        let cache = Arc::new(Mutex::new(self.cache));
 
         println!("Starting download of {} items", urls.len());
 
         let mut js = (0..urls.len())
             .step_by(batch_size)
             .map(|batch| {
+                let outdir = outdir.clone();
                 let urls = urls.clone();
                 let cache = cache.clone();
-                let outdir = outdir.clone();
 
                 async move {
                     let batch = &urls[batch..cmp::min(batch + batch_size, urls.len())];
@@ -309,14 +320,13 @@ impl DownloadInfo {
         while js.join_next().await.is_some() {}
 
         println!("Done downloading. Writing cache.");
-        cache.write().await.save().await?;
+        cache.lock().await.save().await?;
 
         Ok(())
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     // initialize dev env vars
     #[cfg(debug_assertions)]
     dotenv::dotenv()?;
@@ -325,38 +335,45 @@ async fn main() -> Result<()> {
     let cfg = Config::parse();
 
     // get the API key from the environment
-    let key = env::var("YOUTUBE_API_KEY")?;
+    let key = env::var("YOUTUBE_API_KEY")
+        .expect("The YOUTUBE_API_KEY environment variable should be set");
     #[cfg(debug_assertions)]
     println!("Using API key: {}", key);
 
-    // HTTP client
-    let client = Client::builder().gzip(true).build()?;
-
-    // create an interval which will be used in case this was run as a daemon process
-    let mut interval = time::interval(Duration::from_secs(cfg.seconds_interval));
-
     loop {
-        // the first turn, this will run immediately
-        interval.tick().await;
-        // create the required metadata for the download
-        // this includes collecting the urls as well as creating/parsing the cache that will be/is used.
-        if let Result::Ok(info) = DownloadInfo::collect(&cfg, &client, &key).await {
-            // induce the download using the collected info
-            // since this might be daemon-ified we need to handle errors in this case
-            match info.download().await {
-                Result::Ok(_) => println!("Success"),
-                Err(err) => {
-                    eprintln!("Error occured! Printing stacktrace...");
-                    for inner in err.chain() {
-                        eprintln!("{inner}");
-                    }
+        let runtime = RuntimeBuilder::new_multi_thread()
+            .worker_threads(cfg.max_tasks)
+            .enable_all()
+            .build()
+            .expect("Could not build a tokio runtime");
+
+        runtime.block_on(async {
+            // HTTP client
+            let client = Client::builder()
+                .gzip(true)
+                .no_proxy()
+                .build()
+                .expect("Could not create an HTTP client");
+
+            // create the required metadata for the download
+            // this includes collecting the urls as well as creating/parsing the cache that will be/is used.
+            if let Result::Ok(info) = DownloadInfo::collect(&cfg, &client, &key).await {
+                // start the download using the collected info
+                // since this might be daemon-ified we need to handle errors in this case
+                match info.download().await {
+                    Result::Ok(_) => println!("Finished"),
+                    Result::Err(err) => eprintln!("{err}"),
                 }
             }
-        }
+        });
+
+        drop(runtime);
 
         if !cfg.daemon {
             break;
         }
+
+        thread::sleep(Duration::from_secs(cfg.seconds_interval));
     }
 
     Ok(())
