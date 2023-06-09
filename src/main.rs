@@ -229,7 +229,6 @@ impl DownloadInfo {
             }
 
             // TODO: Maybe don't(?) create strings...
-            // API returns
             for song_id in res
                 .get("items")
                 .and_then(JsonValue::as_array)
@@ -304,8 +303,8 @@ impl DownloadInfo {
             .step_by(batch_size)
             .map(|batch| {
                 let outdir = outdir.clone();
-                let urls = urls.clone();
-                let cache = cache.clone();
+                let urls = Arc::clone(&urls);
+                let cache = Arc::clone(&cache);
 
                 async move {
                     let batch = &urls[batch..cmp::min(batch + batch_size, urls.len())];
