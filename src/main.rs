@@ -2,6 +2,7 @@ use std::{
     cmp,
     collections::HashSet,
     env,
+    io::Write,
     path::PathBuf,
     process::{ExitStatus, Stdio},
     sync::Arc,
@@ -336,6 +337,27 @@ fn main() -> Result<()> {
     // get the API key from the environment
     let key = env::var("YOUTUBE_API_KEY")
         .expect("The YOUTUBE_API_KEY environment variable should be set");
+    let lock_fp: PathBuf = PathBuf::from(
+        env::var("XDG_CACHE_HOME")
+            .or(env::var("HOME"))
+            .unwrap_or_else(|_| ".".to_owned()),
+    )
+    .join("playlist-dw.lock");
+
+    #[cfg(debug_assertions)]
+    println!("Lock file: {}", lock_fp.to_str().unwrap());
+
+    let mut lock = fd_lock::RwLock::new(
+        std::fs::File::options()
+            .create(true)
+            .write(true)
+            .open(lock_fp)?,
+    );
+    // exit the program if we cannot write:
+    // it either means we cannot acquire the lock or that another instance is already running
+    let mut lock = lock.try_write()?;
+    writeln!(&mut lock, "{}", std::process::id())?;
+
     #[cfg(debug_assertions)]
     println!("Using API key: {}", key);
 
