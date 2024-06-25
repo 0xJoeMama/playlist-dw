@@ -49,9 +49,9 @@ struct Config {
     #[arg(short, long)]
     #[clap(default_value = "cache")]
     cache_file: PathBuf,
-    /// The ID of the target playlist. The playlist ID is part of the playlist link. To get it,
+    /// The IDs of the target playlists. The playlist ID is part of the playlist link. To get it,
     /// open your playlist, check its link and copy everything after "link="
-    playlist_id: String,
+    playlist_ids: Vec<String>,
     /// The maximum amount of results the YouTube API should respond with.
     /// Higher numbers increase request latency, but decrease request amounts.
     /// Set to the maximum by default.
@@ -158,32 +158,40 @@ impl DownloadInfo {
     // Collect the necessary information for a run.
     async fn collect(cfg: &Config, client: &Client, key: &str) -> Result<Self> {
         println!("Fetching playlist info...");
-        let playlist_info = client
-            .get(PLAYLIST_INFO_FETCH_URL)
-            .query(&[
-                ("part", "contentDetails"),
-                ("fields", "items/contentDetails/itemCount"),
-                ("id", &cfg.playlist_id),
-                ("key", key),
-            ])
-            .send()
-            .await?
-            .json::<JsonValue>()
-            .await?;
-
-        let playlist_size = playlist_info
-            .get("items")
-            .and_then(|items| items.get(0))
-            .and_then(|first_onj| first_onj.get("contentDetails"))
-            .and_then(|content_details| content_details.get("itemCount"))
-            .and_then(JsonValue::as_u64)
-            .expect("Failed to get playlist size");
-
-        println!("Playlist size: {}", playlist_size);
 
         let cache = Cache::from(cfg).await?;
 
-        let pending_urls = Self::init_song_list(playlist_size, cfg, client, key, &cache).await?;
+        let mut pending_urls = Vec::new();
+        for id in &cfg.playlist_ids {
+            println!("Gathering info for playlist {}", id);
+            let playlist_info = client
+                .get(PLAYLIST_INFO_FETCH_URL)
+                .query(&[
+                    ("part", "contentDetails"),
+                    ("fields", "items/contentDetails/itemCount"),
+                    ("id", id),
+                    ("key", key),
+                ])
+                .send()
+                .await?
+                .json::<JsonValue>()
+                .await?;
+
+            let playlist_size = playlist_info
+                .get("items")
+                .and_then(|items| items.get(0))
+                .and_then(|first_onj| first_onj.get("contentDetails"))
+                .and_then(|content_details| content_details.get("itemCount"))
+                .and_then(JsonValue::as_u64)
+                .expect("Failed to get playlist size");
+
+            println!("Playlist size: {}", playlist_size);
+
+            let mut curr_urls =
+                Self::init_song_list(playlist_size, id, cfg.max_results, client, key, &cache)
+                    .await?;
+            pending_urls.append(&mut curr_urls);
+        }
 
         Ok(Self {
             pending_urls,
@@ -195,7 +203,8 @@ impl DownloadInfo {
 
     async fn init_song_list(
         playlist_size: u64,
-        cfg: &Config,
+        playlist_id: &str,
+        max_results: u8,
         client: &Client,
         key: &str,
         cache: &Cache,
@@ -205,9 +214,9 @@ impl DownloadInfo {
         let mut next_page_token: Option<String> = None;
         let req_params = &[
             ("part", "contentDetails"),
-            ("playlistId", &cfg.playlist_id),
+            ("playlistId", playlist_id),
             ("key", key),
-            ("maxResults", &cfg.max_results.to_string()),
+            ("maxResults", &max_results.to_string()),
             // we ask for very specific fields to improve latency
             ("fields", "items/contentDetails/videoId,nextPageToken"),
         ];
@@ -350,6 +359,7 @@ fn main() -> Result<()> {
     let mut lock = fd_lock::RwLock::new(
         std::fs::File::options()
             .create(true)
+            .truncate(false)
             .write(true)
             .open(lock_fp)?,
     );
