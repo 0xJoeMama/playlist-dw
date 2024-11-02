@@ -183,7 +183,7 @@ impl DownloadInfo {
                 .and_then(|first_onj| first_onj.get("contentDetails"))
                 .and_then(|content_details| content_details.get("itemCount"))
                 .and_then(JsonValue::as_u64)
-                .expect("Failed to get playlist size");
+                .unwrap_or_else(|| panic!("could not get size of playlist {id}"));
 
             println!("Playlist size: {}", playlist_size);
 
@@ -335,10 +335,10 @@ impl DownloadInfo {
     }
 }
 
-fn main() -> Result<()> {
+fn main() {
     // initialize dev env vars
     #[cfg(debug_assertions)]
-    dotenv::dotenv()?;
+    dotenv::dotenv().expect("could not initialize environment");
 
     // parse command line arguments in a runtime config
     let cfg = Config::parse();
@@ -356,17 +356,24 @@ fn main() -> Result<()> {
     #[cfg(debug_assertions)]
     println!("Lock file: {}", lock_fp.to_str().unwrap());
 
-    let mut lock = fd_lock::RwLock::new(
-        std::fs::File::options()
+    let lockfile =  std::fs::File::options()
             .create(true)
             .truncate(false)
             .write(true)
-            .open(lock_fp)?,
-    );
-    // exit the program if we cannot write:
-    // it either means we cannot acquire the lock or that another instance is already running
-    let mut lock = lock.try_write()?;
-    writeln!(&mut lock, "{}", std::process::id())?;
+            .open(lock_fp)
+            .expect("could not acquire daemon lock");
+    let mut lock = fd_lock::RwLock::new(lockfile);
+    // we need to use an Option since otherwise this would exit even if we aren't running as a
+    // daemon
+    let _lock = if cfg.daemon {
+        // exit the program if we cannot write:
+        // it either means we cannot acquire the lock or that another instance is already running
+        let mut lock = lock.try_write().expect("daemon lock is used by another process. If that is not true, delete the lock file and retry");
+        writeln!(&mut lock, "{}", std::process::id()).expect("could not write to daemon lock");
+        Some(lock)
+    } else {
+        None
+    };
 
     #[cfg(debug_assertions)]
     println!("Using API key: {}", key);
@@ -406,6 +413,4 @@ fn main() -> Result<()> {
 
         thread::sleep(Duration::from_secs(cfg.seconds_interval));
     }
-
-    Ok(())
 }
