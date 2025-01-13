@@ -70,6 +70,10 @@ struct Config {
     /// more).
     #[arg(long, default_value_t = 10)]
     max_tasks: usize,
+    /// Config file used to execute. This file contains lines with either playlist IDs or with
+    /// include <path>, which includes in the current run a file from a different location.
+    /// All playlists in one file are included in the directory their configs are located in.
+    file: Option<PathBuf>,
 }
 
 /// Download cache
@@ -356,12 +360,12 @@ fn main() {
     #[cfg(debug_assertions)]
     println!("Lock file: {}", lock_fp.to_str().unwrap());
 
-    let lockfile =  std::fs::File::options()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(lock_fp)
-            .expect("could not acquire daemon lock");
+    let lockfile = std::fs::File::options()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(lock_fp)
+        .expect("could not acquire daemon lock");
     let mut lock = fd_lock::RwLock::new(lockfile);
     // we need to use an Option since otherwise this would exit even if we aren't running as a
     // daemon
