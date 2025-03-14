@@ -121,10 +121,15 @@ impl DownloadFile {
                             .expect("could not evaluate nested file")
                     }
                 }
-                DownloadFileEntry::VideoId(ref id) => res_buf.push(DownloadEntry {
-                    path: self.path.to_path_buf(),
-                    url: create_song_from_id(id),
-                }),
+                DownloadFileEntry::VideoId(ref id) => {
+                    let url = create_song_from_id(id);
+                    if !cache.contains(&url).await {
+                        res_buf.push(DownloadEntry {
+                            path: self.path.to_path_buf(),
+                            url,
+                        })
+                    }
+                }
             }
         }
         Ok(())
