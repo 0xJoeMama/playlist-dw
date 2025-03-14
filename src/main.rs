@@ -15,6 +15,7 @@ use anyhow::{anyhow, Ok, Result};
 use clap::Parser;
 use reqwest::Client;
 use serde_json::Value as JsonValue;
+use tokio::fs;
 use tokio::{
     fs::{File, OpenOptions},
     io::{AsyncReadExt, AsyncWriteExt},
@@ -39,7 +40,7 @@ const YT_DLP_ARGS: [&str; 8] = [
 ];
 
 enum DownloadFileEntry {
-    Id(String),
+    PlaylistId(String),
     File(PathBuf),
 }
 
@@ -67,7 +68,7 @@ impl TryFrom<&PathBuf> for DownloadFile {
                 if let Some(loc) = line.strip_prefix("include ") {
                     DownloadFileEntry::File(path.join(loc))
                 } else {
-                    DownloadFileEntry::Id(line.to_owned())
+                    DownloadFileEntry::PlaylistId(line.to_owned())
                 }
             })
             .collect();
@@ -97,7 +98,7 @@ impl DownloadFile {
         );
         for entry in self.entries {
             match entry {
-                DownloadFileEntry::Id(ref id) => res_buf.extend(
+                DownloadFileEntry::PlaylistId(ref id) => res_buf.extend(
                     DownloadInfo::get_playlist_songs(client, cfg, id, key, cache, &self.path)
                         .await?,
                 ),
@@ -394,6 +395,7 @@ impl DownloadInfo {
         let mut stati = Vec::with_capacity(downloads.len());
         for entry in downloads {
             let mut cmd = Command::new("yt-dlp");
+            fs::create_dir_all(&entry.path).await?;
             stati.push(
                 cmd.current_dir(&entry.path)
                     .stdin(Stdio::null())
@@ -416,7 +418,6 @@ impl DownloadInfo {
             return Ok(());
         }
 
-        // TODO: properly create destination directories
         // fs::create_dir_all(&self.output_dir).await?;
 
         let batch_size = cmp::max(1, self.pending_downloads.len() / self.max_tasks);
