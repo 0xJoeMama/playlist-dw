@@ -1,4 +1,5 @@
 use std::io::Write;
+use std::path::Path;
 use std::{
     cmp,
     collections::HashSet,
@@ -58,7 +59,7 @@ impl TryFrom<&PathBuf> for DownloadFile {
             .map(|it| it.to_path_buf())
             .ok_or(anyhow!("path problem"))?;
 
-        let s = std::fs::read_to_string(&value)?;
+        let s = std::fs::read_to_string(value)?;
         let entries = s
             .lines()
             .filter(|l| !l.starts_with('#') && !l.trim().is_empty())
@@ -246,7 +247,7 @@ impl DownloadInfo {
         id: &str,
         key: &str,
         cache: &Cache,
-        output_dir: &PathBuf,
+        output_dir: &Path,
     ) -> Result<Vec<DownloadEntry>> {
         println!("Gathering info for playlist {}", id);
         let playlist_info = client
@@ -279,7 +280,7 @@ impl DownloadInfo {
             output_dir,
             client,
             key,
-            &cache,
+            cache,
         )
         .await
     }
@@ -319,7 +320,7 @@ impl DownloadInfo {
         playlist_size: u64,
         playlist_id: &str,
         max_results: u8,
-        output_dir: &PathBuf,
+        output_dir: &Path,
         client: &Client,
         key: &str,
         cache: &Cache,
@@ -367,7 +368,7 @@ impl DownloadInfo {
                     if let Some(song_id) = song_id.as_str() {
                         DownloadEntry {
                             url: String::from("https://www.youtube.com/watch?v=") + song_id,
-                            path: output_dir.clone(),
+                            path: output_dir.to_path_buf(),
                         }
                     } else {
                         return Err(anyhow!("Could not properly parse playlistItems request"));
@@ -402,7 +403,7 @@ impl DownloadInfo {
                     .stdout(Stdio::null())
                     .stderr(Stdio::null())
                     .args(YT_DLP_ARGS)
-                    .args(&[&entry.url])
+                    .args([&entry.url])
                     .spawn()?
                     .wait()
                     .await?,
