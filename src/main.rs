@@ -1,9 +1,8 @@
+use std::collections::HashMap;
 use std::io::Write;
 use std::path::Path;
 use std::{
-    cmp,
-    collections::HashSet,
-    env,
+    cmp, env,
     path::PathBuf,
     process::{ExitStatus, Stdio},
     sync::Arc,
@@ -11,7 +10,7 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{anyhow, Ok, Result};
+use anyhow::{anyhow, Result};
 
 use clap::Parser;
 use reqwest::Client;
@@ -42,6 +41,7 @@ const YT_DLP_ARGS: [&str; 8] = [
 
 enum DownloadFileEntry {
     PlaylistId(String),
+    VideoId(String),
     File(PathBuf),
 }
 
@@ -63,13 +63,20 @@ impl TryFrom<&PathBuf> for DownloadFile {
         let entries = s
             .lines()
             .filter(|l| !l.starts_with('#') && !l.trim().is_empty())
-            .map(|line| {
+            .filter_map(|line| {
                 // cut comments out
                 let line = line.split_once('#').map_or(line, |(a, _)| a);
                 if let Some(loc) = line.strip_prefix("include ") {
-                    DownloadFileEntry::File(path.join(loc))
+                    Some(DownloadFileEntry::File(path.join(loc)))
                 } else {
-                    DownloadFileEntry::PlaylistId(line.to_owned())
+                    let (t, id) = line.split_once(": ")?;
+                    let id = id.trim();
+                    let t = t.trim();
+                    match t.trim() {
+                        "playlist" => Some(DownloadFileEntry::PlaylistId(id.to_owned())),
+                        "song" => Some(DownloadFileEntry::VideoId(id.to_owned())),
+                        _ => None,
+                    }
                 }
             })
             .collect();
@@ -82,6 +89,10 @@ impl TryFrom<&PathBuf> for DownloadFile {
 struct DownloadEntry {
     path: PathBuf,
     url: String,
+}
+
+pub(crate) fn create_song_from_id(song_id: &str) -> String {
+    format!("https://www.youtube.com/watch?v={song_id}")
 }
 
 impl DownloadFile {
@@ -104,12 +115,16 @@ impl DownloadFile {
                         .await?,
                 ),
                 DownloadFileEntry::File(ref path_buf) => {
-                    if let Result::Ok(new_file) = DownloadFile::try_from(path_buf) {
+                    if let Ok(new_file) = DownloadFile::try_from(path_buf) {
                         Box::pin(new_file.eval_file(client, cfg, key, cache, res_buf))
                             .await
                             .expect("could not evaluate nested file")
                     }
                 }
+                DownloadFileEntry::VideoId(ref id) => res_buf.push(DownloadEntry {
+                    path: self.path.to_path_buf(),
+                    url: create_song_from_id(id),
+                }),
             }
         }
         Ok(())
@@ -159,7 +174,7 @@ struct Config {
 #[derive(Debug)]
 struct Cache {
     // old cache stored as a set
-    contents: HashSet<String>,
+    contents: HashMap<String, PathBuf>,
     // file that is kept open while the app is running
     cache_file: File,
     // whether there has been an update
@@ -185,7 +200,13 @@ impl Cache {
                 let mut contents = String::new();
                 cache_file.read_to_string(&mut contents).await?;
 
-                contents.lines().map(str::to_owned).collect()
+                contents
+                    .lines()
+                    .map(|line| {
+                        let (url, path) = line.split_once(" : ").unwrap();
+                        (url.trim().to_owned(), cfg.cache_file.join(path.trim()))
+                    })
+                    .collect()
             };
 
             Ok(Self {
@@ -195,22 +216,22 @@ impl Cache {
             })
         } else {
             Ok(Self {
-                contents: HashSet::new(),
+                contents: HashMap::new(),
                 cache_file: File::create(path).await?,
                 dirty: false,
             })
         }
     }
 
-    fn contains(&self, url: &str) -> bool {
-        self.contents.contains(url)
+    async fn contains(&self, url: &str) -> bool {
+        self.contents.contains_key(url)
     }
 
     /// Appends 'urls' to the end of the file, **without saving**.
     async fn emit(&mut self, downloads: &[DownloadEntry]) -> Result<()> {
         let mut output = downloads
             .iter()
-            .map(|it| it.url.clone())
+            .map(|it| format!("{} : {}", it.url, it.path.to_string_lossy()))
             .collect::<Vec<_>>()
             .join("\n");
         output.push('\n');
@@ -367,7 +388,7 @@ impl DownloadInfo {
                 let entry = {
                     if let Some(song_id) = song_id.as_str() {
                         DownloadEntry {
-                            url: String::from("https://www.youtube.com/watch?v=") + song_id,
+                            url: create_song_from_id(song_id),
                             path: output_dir.to_path_buf(),
                         }
                     } else {
@@ -375,7 +396,7 @@ impl DownloadInfo {
                     }
                 };
 
-                if !cache.contains(&entry.url) {
+                if !cache.contains(&entry.url).await {
                     downloads.push(entry);
                 }
             }
@@ -513,7 +534,7 @@ fn main() {
 
             // create the required metadata for the download
             // this includes collecting the urls as well as creating/parsing the cache that will be/is used.
-            if let Result::Ok(info) = DownloadInfo::collect(&cfg, &client, &key).await {
+            if let Ok(info) = DownloadInfo::collect(&cfg, &client, &key).await {
                 // start the download using the collected info
                 // since this might be daemon-ified we need to handle errors in this case
                 match info.download().await {
