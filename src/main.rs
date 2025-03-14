@@ -1,8 +1,8 @@
+use std::io::Write;
 use std::{
     cmp,
     collections::HashSet,
     env,
-    io::Write,
     path::PathBuf,
     process::{ExitStatus, Stdio},
     sync::Arc,
@@ -16,7 +16,7 @@ use clap::Parser;
 use reqwest::Client;
 use serde_json::Value as JsonValue;
 use tokio::{
-    fs::{self, File, OpenOptions},
+    fs::{File, OpenOptions},
     io::{AsyncReadExt, AsyncWriteExt},
     process::Command,
     runtime::Builder as RuntimeBuilder,
@@ -37,6 +37,82 @@ const YT_DLP_ARGS: [&str; 8] = [
     "--output",
     "%(title).90s.%(ext)s",
 ];
+
+enum DownloadFileEntry {
+    Id(String),
+    File(PathBuf),
+}
+
+struct DownloadFile {
+    path: PathBuf,
+    entries: Vec<DownloadFileEntry>,
+}
+
+impl TryFrom<&PathBuf> for DownloadFile {
+    type Error = anyhow::Error;
+
+    fn try_from(value: &PathBuf) -> std::result::Result<Self, Self::Error> {
+        let path = value
+            .parent()
+            .map(|it| it.to_path_buf())
+            .ok_or(anyhow!("path problem"))?;
+
+        let s = std::fs::read_to_string(&value)?;
+        let entries = s
+            .lines()
+            .filter(|l| !l.starts_with('#') && !l.trim().is_empty())
+            .map(|line| {
+                // cut comments out
+                let line = line.split_once('#').map_or(line, |(a, _)| a);
+                if let Some(loc) = line.strip_prefix("include ") {
+                    DownloadFileEntry::File(path.join(loc))
+                } else {
+                    DownloadFileEntry::Id(line.to_owned())
+                }
+            })
+            .collect();
+
+        Ok(DownloadFile { path, entries })
+    }
+}
+
+#[derive(Debug)]
+struct DownloadEntry {
+    path: PathBuf,
+    url: String,
+}
+
+impl DownloadFile {
+    async fn eval_file(
+        self,
+        client: &Client,
+        cfg: &Config,
+        key: &str,
+        cache: &Cache,
+        res_buf: &mut Vec<DownloadEntry>,
+    ) -> Result<()> {
+        println!(
+            "Evaluating input file in folder {}",
+            self.path.to_string_lossy()
+        );
+        for entry in self.entries {
+            match entry {
+                DownloadFileEntry::Id(ref id) => res_buf.extend(
+                    DownloadInfo::get_playlist_songs(client, cfg, id, key, cache, &self.path)
+                        .await?,
+                ),
+                DownloadFileEntry::File(ref path_buf) => {
+                    if let Result::Ok(new_file) = DownloadFile::try_from(path_buf) {
+                        Box::pin(new_file.eval_file(client, cfg, key, cache, res_buf))
+                            .await
+                            .expect("could not evaluate nested file")
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
 
 #[derive(Debug, Parser)]
 #[command(author, version, about)]
@@ -73,6 +149,7 @@ struct Config {
     /// Config file used to execute. This file contains lines with either playlist IDs or with
     /// include <path>, which includes in the current run a file from a different location.
     /// All playlists in one file are included in the directory their configs are located in.
+    #[arg(required = true, last = true)]
     file: Option<PathBuf>,
 }
 
@@ -128,8 +205,12 @@ impl Cache {
     }
 
     /// Appends 'urls' to the end of the file, **without saving**.
-    async fn emit(&mut self, urls: &[String]) -> Result<()> {
-        let mut output = urls.join("\n");
+    async fn emit(&mut self, downloads: &[DownloadEntry]) -> Result<()> {
+        let mut output = downloads
+            .iter()
+            .map(|it| it.url.clone())
+            .collect::<Vec<_>>()
+            .join("\n");
         output.push('\n');
 
         self.cache_file.write_all(output.as_bytes()).await?;
@@ -152,54 +233,82 @@ impl Cache {
 /// Required information from YouTube API and also the runtime config.
 #[derive(Debug)]
 struct DownloadInfo {
-    pending_urls: Vec<String>, // urls to be downloaded
-    output_dir: PathBuf,       // the output directory
-    cache: Cache,              // local cache
-    max_tasks: usize,          // max amount of tasks to start
+    pending_downloads: Vec<DownloadEntry>, // urls to be downloaded
+    cache: Cache,                          // local cache
+    max_tasks: usize,                      // max amount of tasks to start
 }
 
 impl DownloadInfo {
+    async fn get_playlist_songs(
+        client: &Client,
+        cfg: &Config,
+        id: &str,
+        key: &str,
+        cache: &Cache,
+        output_dir: &PathBuf,
+    ) -> Result<Vec<DownloadEntry>> {
+        println!("Gathering info for playlist {}", id);
+        let playlist_info = client
+            .get(PLAYLIST_INFO_FETCH_URL)
+            .query(&[
+                ("part", "contentDetails"),
+                ("fields", "items/contentDetails/itemCount"),
+                ("id", id),
+                ("key", key),
+            ])
+            .send()
+            .await?
+            .json::<JsonValue>()
+            .await?;
+
+        let playlist_size = playlist_info
+            .get("items")
+            .and_then(|items| items.get(0))
+            .and_then(|first_onj| first_onj.get("contentDetails"))
+            .and_then(|content_details| content_details.get("itemCount"))
+            .and_then(JsonValue::as_u64)
+            .unwrap_or_else(|| panic!("could not get size of playlist {id}"));
+
+        println!("Playlist size: {}", playlist_size);
+
+        Self::init_song_list(
+            playlist_size,
+            id,
+            cfg.max_results,
+            output_dir,
+            client,
+            key,
+            &cache,
+        )
+        .await
+    }
+
     // Collect the necessary information for a run.
     async fn collect(cfg: &Config, client: &Client, key: &str) -> Result<Self> {
         println!("Fetching playlist info...");
 
         let cache = Cache::from(cfg).await?;
 
-        let mut pending_urls = Vec::new();
+        let mut pending_downloads = Vec::new();
+        if let Some(ref input_file) = cfg.file {
+            println!("Using file {} for input", input_file.to_str().unwrap());
+            let download_file: DownloadFile = input_file.try_into()?;
+            download_file
+                .eval_file(client, cfg, key, &cache, &mut pending_downloads)
+                .await
+                .expect("could not evaluate input file");
+        }
+
         for id in &cfg.playlist_ids {
-            println!("Gathering info for playlist {}", id);
-            let playlist_info = client
-                .get(PLAYLIST_INFO_FETCH_URL)
-                .query(&[
-                    ("part", "contentDetails"),
-                    ("fields", "items/contentDetails/itemCount"),
-                    ("id", id),
-                    ("key", key),
-                ])
-                .send()
-                .await?
-                .json::<JsonValue>()
-                .await?;
-
-            let playlist_size = playlist_info
-                .get("items")
-                .and_then(|items| items.get(0))
-                .and_then(|first_onj| first_onj.get("contentDetails"))
-                .and_then(|content_details| content_details.get("itemCount"))
-                .and_then(JsonValue::as_u64)
-                .unwrap_or_else(|| panic!("could not get size of playlist {id}"));
-
-            println!("Playlist size: {}", playlist_size);
-
-            let mut curr_urls =
-                Self::init_song_list(playlist_size, id, cfg.max_results, client, key, &cache)
-                    .await?;
-            pending_urls.append(&mut curr_urls);
+            pending_downloads.extend(
+                Self::get_playlist_songs(client, cfg, id, key, &cache, &cfg.output_dir)
+                    .await
+                    .expect("cannot initialize playlist stuff"),
+            );
         }
 
         Ok(Self {
-            pending_urls,
-            output_dir: cfg.output_dir.clone(),
+            pending_downloads,
             cache,
             max_tasks: cfg.max_tasks,
         })
@@ -209,11 +318,12 @@ impl DownloadInfo {
         playlist_size: u64,
         playlist_id: &str,
         max_results: u8,
+        output_dir: &PathBuf,
         client: &Client,
         key: &str,
         cache: &Cache,
-    ) -> Result<Vec<String>> {
-        let mut urls = Vec::new();
+    ) -> Result<Vec<DownloadEntry>> {
+        let mut downloads = Vec::new();
         let mut fetched_cnt: u64 = 0;
         let mut next_page_token: Option<String> = None;
         let req_params = &[
@@ -252,77 +362,79 @@ impl DownloadInfo {
                 .filter_map(|content_details| content_details.get("videoId"))
             {
                 fetched_cnt += 1;
-                let url = {
+                let entry = {
                     if let Some(song_id) = song_id.as_str() {
-                        String::from("https://www.youtube.com/watch?v=") + song_id
+                        DownloadEntry {
+                            url: String::from("https://www.youtube.com/watch?v=") + song_id,
+                            path: output_dir.clone(),
+                        }
                     } else {
                         return Err(anyhow!("Could not properly parse playlistItems request"));
                     }
                 };
 
-                if !cache.contains(&url) {
-                    urls.push(url);
+                if !cache.contains(&entry.url) {
+                    downloads.push(entry);
                 }
             }
         }
 
         println!(
             "Done fetching playlist items: {} new items found",
-            urls.len()
+            downloads.len()
         );
 
-        Ok(urls)
+        Ok(downloads)
     }
 
-    async fn create_download_task(
-        urls: &[String],
+    async fn create_download_tasks(
+        downloads: &[DownloadEntry],
         cache: Arc<Mutex<Cache>>, // cursed type kekw
-        outdir: PathBuf,
-    ) -> Result<ExitStatus> {
-        let mut cmd = Command::new("yt-dlp");
-        let status = cmd
-            .current_dir(outdir)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .args(YT_DLP_ARGS)
-            .args(urls)
-            .spawn()?
-            .wait()
-            .await?;
-
-        cache.lock().await.emit(urls).await?;
-        println!("Dropped cache, urls, outdir");
-        Ok(status)
+    ) -> Result<Vec<ExitStatus>> {
+        let mut stati = Vec::with_capacity(downloads.len());
+        for entry in downloads {
+            let mut cmd = Command::new("yt-dlp");
+            stati.push(
+                cmd.current_dir(&entry.path)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .args(YT_DLP_ARGS)
+                    .args(&[&entry.url])
+                    .spawn()?
+                    .wait()
+                    .await?,
+            );
+        }
+        cache.lock().await.emit(downloads).await?;
+        println!("emitted cache");
+        Ok(stati)
     }
 
     async fn download(self) -> Result<()> {
-        if self.pending_urls.is_empty() {
+        if self.pending_downloads.is_empty() {
             return Ok(());
         }
 
-        if !self.output_dir.exists() {
-            fs::create_dir_all(&self.output_dir).await?;
-        }
+        // TODO: properly create destination directories
+        // fs::create_dir_all(&self.output_dir).await?;
 
-        let batch_size = cmp::max(1, self.pending_urls.len() / self.max_tasks);
+        let batch_size = cmp::max(1, self.pending_downloads.len() / self.max_tasks);
 
-        let outdir = self.output_dir;
-        let urls = Arc::new(self.pending_urls);
+        let downloads = Arc::new(self.pending_downloads);
         let cache = Arc::new(Mutex::new(self.cache));
 
-        println!("Starting download of {} items", urls.len());
+        println!("Starting download of {} items", downloads.len());
 
-        let mut js = (0..urls.len())
+        let mut js = (0..downloads.len())
             .step_by(batch_size)
             .map(|batch| {
-                let outdir = outdir.clone();
-                let urls = Arc::clone(&urls);
+                let urls = Arc::clone(&downloads);
                 let cache = Arc::clone(&cache);
 
                 async move {
                     let batch = &urls[batch..cmp::min(batch + batch_size, urls.len())];
-                    Self::create_download_task(batch, cache, outdir).await
+                    Self::create_download_tasks(batch, cache).await
                 }
             })
             .fold(JoinSet::new(), |mut js, next| {
