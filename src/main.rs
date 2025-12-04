@@ -1,14 +1,7 @@
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::Path;
-use std::{
-    cmp, env,
-    path::PathBuf,
-    process::{ExitStatus, Stdio},
-    sync::Arc,
-    thread,
-    time::Duration,
-};
+use std::{cmp, env, path::PathBuf, process::Stdio, sync::Arc, thread, time::Duration};
 
 use anyhow::{anyhow, Result};
 
@@ -28,7 +21,7 @@ use tokio::{
 const PLAYLIST_INFO_FETCH_URL: &str = "https://www.googleapis.com/youtube/v3/playlists";
 const PLAYLIST_ITEMS_FETCH_URL: &str = "https://www.googleapis.com/youtube/v3/playlistItems";
 
-const YT_DLP_ARGS: [&str; 8] = [
+const YT_DLP_ARGS: [&str; 11] = [
     "--extract-audio",
     "--audio-format",
     "mp3",
@@ -37,6 +30,9 @@ const YT_DLP_ARGS: [&str; 8] = [
     "%(artist) - %(title)s",
     "--output",
     "%(title).90s.%(ext)s",
+    "--print",
+    "filename",
+    "--no-simulate",
 ];
 
 enum DownloadFileEntry {
@@ -123,7 +119,7 @@ impl DownloadFile {
                 }
                 DownloadFileEntry::VideoId(ref id) => {
                     let url = create_song_from_id(id);
-                    if !cache.contains(&url).await {
+                    if !cache.exists(&url) {
                         res_buf.push(DownloadEntry {
                             path: self.path.to_path_buf(),
                             url,
@@ -207,9 +203,10 @@ impl Cache {
 
                 contents
                     .lines()
+                    .filter(|it| !it.is_empty())
                     .map(|line| {
                         let (url, path) = line.split_once(" : ").unwrap();
-                        (url.trim().to_owned(), cfg.cache_file.join(path.trim()))
+                        (url.trim().to_owned(), path.trim().into())
                     })
                     .collect()
             };
@@ -228,22 +225,29 @@ impl Cache {
         }
     }
 
-    async fn contains(&self, url: &str) -> bool {
-        self.contents.contains_key(url)
+    fn exists(&self, url: &str) -> bool {
+        self.contents.get(url).is_some_and(|it| {
+            println!("Checking for existence of {it:?}");
+            it.exists()
+        })
     }
 
     /// Appends 'urls' to the end of the file, **without saving**.
-    async fn emit(&mut self, downloads: &[DownloadEntry]) -> Result<()> {
+    async fn emit(&mut self, downloads: Vec<(&DownloadEntry, String)>) -> Result<()> {
         let mut output = downloads
-            .iter()
-            .map(|it| format!("{} : {}", it.url, it.path.to_string_lossy()))
+            .into_iter()
+            .map(|(entry, file)| {
+                let filepath = &mut entry.path.join(file);
+                filepath.set_extension("mp3");
+                format!("{} : {}", entry.url, filepath.to_string_lossy())
+            })
             .collect::<Vec<_>>()
             .join("\n");
         output.push('\n');
 
         self.cache_file.write_all(output.as_bytes()).await?;
-
         self.dirty = true;
+
         Ok(())
     }
 
@@ -275,7 +279,7 @@ impl DownloadInfo {
         cache: &Cache,
         output_dir: &Path,
     ) -> Result<Vec<DownloadEntry>> {
-        println!("Gathering info for playlist {}", id);
+        println!("Gathering info for playlist {id}");
         let playlist_info = client
             .get(PLAYLIST_INFO_FETCH_URL)
             .query(&[
@@ -297,7 +301,7 @@ impl DownloadInfo {
             .and_then(JsonValue::as_u64)
             .unwrap_or_else(|| panic!("could not get size of playlist {id}"));
 
-        println!("Playlist size: {}", playlist_size);
+        println!("Playlist size: {playlist_size}");
 
         Self::init_song_list(
             playlist_size,
@@ -380,7 +384,6 @@ impl DownloadInfo {
                 next_page_token = tkn.as_str().map(str::to_owned);
             }
 
-            // TODO: Maybe don't(?) create strings...
             for song_id in res
                 .get("items")
                 .and_then(JsonValue::as_array)
@@ -401,7 +404,7 @@ impl DownloadInfo {
                     }
                 };
 
-                if !cache.contains(&entry.url).await {
+                if !cache.exists(&entry.url) {
                     downloads.push(entry);
                 }
             }
@@ -418,26 +421,38 @@ impl DownloadInfo {
     async fn create_download_tasks(
         downloads: &[DownloadEntry],
         cache: Arc<Mutex<Cache>>, // cursed type kekw
-    ) -> Result<Vec<ExitStatus>> {
+    ) -> Result<()> {
         let mut stati = Vec::with_capacity(downloads.len());
         for entry in downloads {
             let mut cmd = Command::new("yt-dlp");
             fs::create_dir_all(&entry.path).await?;
-            stati.push(
-                cmd.current_dir(&entry.path)
-                    .stdin(Stdio::null())
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .args(YT_DLP_ARGS)
-                    .args([&entry.url])
-                    .spawn()?
-                    .wait()
-                    .await?,
-            );
+
+            let mut child = cmd
+                .current_dir(&entry.path)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .args(YT_DLP_ARGS)
+                .args([&entry.url])
+                .spawn()?;
+
+            if !child.wait().await?.success() {
+                return Err(anyhow!("failed to execute child properly"));
+            }
+
+            let mut filename = String::with_capacity(16);
+            child
+                .stdout
+                .ok_or(anyhow!("Could not get stdout of child"))?
+                .read_to_string(&mut filename)
+                .await?;
+
+            stati.push((entry, filename));
         }
-        cache.lock().await.emit(downloads).await?;
+
+        cache.lock().await.emit(stati).await?;
         println!("emitted cache");
-        Ok(stati)
+        Ok(())
     }
 
     async fn download(self) -> Result<()> {
@@ -520,7 +535,7 @@ fn main() {
     };
 
     #[cfg(debug_assertions)]
-    println!("Using API key: {}", key);
+    println!("Using API key: {key}");
 
     loop {
         let runtime = RuntimeBuilder::new_multi_thread()
