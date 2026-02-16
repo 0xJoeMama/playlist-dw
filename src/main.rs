@@ -87,7 +87,7 @@ struct DownloadEntry {
     url: String,
 }
 
-pub(crate) fn create_song_from_id(song_id: &str) -> String {
+fn create_song_from_id(song_id: &str) -> String {
     format!("https://www.youtube.com/watch?v={song_id}")
 }
 
@@ -167,7 +167,7 @@ struct Config {
     /// Config file used to execute. This file contains lines with either playlist IDs or with
     /// include <path>, which includes in the current run a file from a different location.
     /// All playlists in one file are included in the directory their configs are located in.
-    #[arg(required = true, last = true)]
+    #[arg(last = true)]
     file: Option<PathBuf>,
 }
 
@@ -299,7 +299,7 @@ impl DownloadInfo {
             .and_then(|first_onj| first_onj.get("contentDetails"))
             .and_then(|content_details| content_details.get("itemCount"))
             .and_then(JsonValue::as_u64)
-            .unwrap_or_else(|| panic!("could not get size of playlist {id}"));
+            .ok_or(anyhow!("failed to get playlist size"))?;
 
         println!("Playlist size: {playlist_size}");
 
@@ -332,11 +332,10 @@ impl DownloadInfo {
         }
 
         for id in &cfg.playlist_ids {
-            pending_downloads.extend(
-                Self::get_playlist_songs(client, cfg, id, key, &cache, &cfg.output_dir)
-                    .await
-                    .expect("cannot initialize playlist stuff"),
-            );
+            match  Self::get_playlist_songs(client, cfg, id, key, &cache, &cfg.output_dir).await {
+                Ok(songs) => pending_downloads.extend(songs),
+                Err(err) => eprintln!("{err}"),
+            }
         }
 
         Ok(Self {
@@ -524,7 +523,7 @@ fn main() {
     let mut lock = fd_lock::RwLock::new(lockfile);
     // we need to use an Option since otherwise this would exit even if we aren't running as a
     // daemon
-    let _lock = if cfg.daemon {
+    let _guard = if cfg.daemon {
         // exit the program if we cannot write:
         // it either means we cannot acquire the lock or that another instance is already running
         let mut lock = lock.try_write().expect("daemon lock is used by another process. If that is not true, delete the lock file and retry");
